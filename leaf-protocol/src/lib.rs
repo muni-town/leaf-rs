@@ -1,4 +1,4 @@
-use flume::{Receiver, Sender, r#async::RecvStream};
+use flume::{Sender, r#async::RecvStream};
 use futures::StreamExt;
 use std::{
     collections::{HashMap, VecDeque},
@@ -10,8 +10,8 @@ use std::{
 pub use anyhow::Result;
 pub use beelay_core::StorageKey;
 use beelay_core::{
-    Beelay, CommandId, CommandResult, Commit, Config, DocumentId, Event, EventResults, PeerId,
-    Stopped, UnixTimestampMillis,
+    Beelay, CommandId, CommandResult, Commit, CommitOrBundle, Config, DocumentId, Event,
+    EventResults, PeerId, Stopped, UnixTimestampMillis,
     io::{IoAction, IoResult, IoTask},
     keyhive::KeyhiveEntityId,
     loading::Step,
@@ -23,6 +23,7 @@ use crate::io::{IoTaskExt, LeafIo, TaskQueue};
 
 pub mod io;
 
+#[derive(Clone)]
 pub struct Leaf {
     id: PeerId,
     events: Sender<LeafEvent>,
@@ -47,10 +48,12 @@ impl From<LeafId> for KeyhiveEntityId {
 enum LeafEvent {
     Stop,
     CreateDoc(oneshot::Sender<LeafResponse>, Commit, Vec<LeafId>),
+    LoadDoc(oneshot::Sender<LeafResponse>, DocumentId),
 }
 
 enum LeafResponse {
     CreateDoc(Result<DocumentId>),
+    LoadDoc(Option<Vec<CommitOrBundle>>),
 }
 
 impl Leaf {
@@ -119,6 +122,7 @@ impl Leaf {
         self.events.try_send(LeafEvent::Stop).ok();
     }
 
+    /// Create a new document
     pub async fn create_doc(
         &self,
         commit: Commit,
@@ -129,9 +133,21 @@ impl Leaf {
             .send(LeafEvent::CreateDoc(responder, commit, other_owners))
             .ok();
 
-        #[allow(irrefutable_let_patterns)] // Temporary
         if let LeafResponse::CreateDoc(doc_id) =
             response.into_future().await.expect("channel error")
+        {
+            doc_id
+        } else {
+            panic!("Invalid response type")
+        }
+    }
+
+    /// Load a document
+    pub async fn load_doc(&self, doc_id: DocumentId) -> Option<Vec<CommitOrBundle>> {
+        let (responder, response) = oneshot::channel();
+        self.events.send(LeafEvent::LoadDoc(responder, doc_id)).ok();
+
+        if let LeafResponse::LoadDoc(doc_id) = response.into_future().await.expect("channel error")
         {
             doc_id
         } else {
@@ -184,9 +200,13 @@ impl<Io: LeafIo> Future for LeafRunner<Io> {
                             .send(LeafResponse::CreateDoc(document_id.map_err(|e| e.into())))
                             .ok();
                     }
+                    CommandResult::LoadDoc(commit_or_bundles) => {
+                        responder
+                            .send(LeafResponse::LoadDoc(commit_or_bundles))
+                            .ok();
+                    }
                     CommandResult::AddCommits(bundle_specs) => {}
                     CommandResult::AddBundle(_) => todo!(),
-                    CommandResult::LoadDoc(commit_or_bundles) => todo!(),
                     CommandResult::CreateStream(stream_id) => todo!(),
                     CommandResult::DisconnectStream => todo!(),
                     CommandResult::HandleRequest(endpoint_response) => todo!(),
@@ -209,6 +229,11 @@ impl<Io: LeafIo> Future for LeafRunner<Io> {
                         commit,
                         keyhive_entity_ids.into_iter().map(Into::into).collect(),
                     );
+                    command_responders.insert(command, responder);
+                    ev
+                }
+                LeafEvent::LoadDoc(responder, doc_id) => {
+                    let (command, ev) = Event::load_doc(doc_id);
                     command_responders.insert(command, responder);
                     ev
                 }

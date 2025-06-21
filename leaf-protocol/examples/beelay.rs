@@ -1,6 +1,6 @@
-use std::time::Duration;
+use std::{str::FromStr, time::Duration};
 
-use beelay_core::{Commit, CommitHash};
+use beelay_core::{Commit, CommitHash, DocumentId};
 use leaf_protocol::{io::native::NativeIo, *};
 
 #[tokio::main]
@@ -12,19 +12,24 @@ async fn main() -> Result<()> {
 
     tokio::spawn(async move {
         let doc = leaf
-            .create_doc(
-                Commit::new(
-                    Vec::new(),
-                    Vec::new(),
-                    CommitHash::try_from(&[0; 32][..]).unwrap(),
-                ),
-                Vec::new(),
+            .load_doc(
+                DocumentId::from_str("2cdu3VYtG5z9FsogMFPXb57JVd3NsA1wpVc6x1CXzUtumahVwT").unwrap(),
             )
-            .await
-            .unwrap();
+            .await;
         dbg!(doc);
+        // let doc = leaf
+        //     .create_doc(
+        //         Commit::new(
+        //             Vec::new(),
+        //             Vec::new(),
+        //             CommitHash::try_from(&[0; 32][..]).unwrap(),
+        //         ),
+        //         Vec::new(),
+        //     )
+        //     .await
+        //     .unwrap();
+        // dbg!(doc);
 
-        tokio::time::sleep(Duration::from_secs(2)).await;
         leaf.stop();
     });
 
