@@ -1,4 +1,4 @@
-use flume::{Sender, r#async::RecvStream};
+use flume::{Receiver, Sender, r#async::RecvStream};
 use futures::StreamExt;
 use std::{
     collections::{HashMap, VecDeque},
@@ -10,8 +10,10 @@ use std::{
 pub use anyhow::Result;
 pub use beelay_core::StorageKey;
 use beelay_core::{
-    Beelay, Config, Event, EventResults, PeerId, Stopped, UnixTimestampMillis,
+    Beelay, CommandId, CommandResult, Commit, Config, DocumentId, Event, EventResults, PeerId,
+    Stopped, UnixTimestampMillis,
     io::{IoAction, IoResult, IoTask},
+    keyhive::KeyhiveEntityId,
     loading::Step,
 };
 pub use ed25519_dalek::Signature;
@@ -26,17 +28,29 @@ pub struct Leaf {
     events: Sender<LeafEvent>,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-enum LeafEvent {
-    Stop,
+pub enum LeafId {
+    Public,
+    Group(PeerId),
+    Doc(DocumentId),
 }
 
-impl From<LeafEvent> for beelay_core::Event {
-    fn from(val: LeafEvent) -> Self {
-        match val {
-            LeafEvent::Stop => Event::stop(),
+impl From<LeafId> for KeyhiveEntityId {
+    fn from(value: LeafId) -> Self {
+        match value {
+            LeafId::Public => Self::Public,
+            LeafId::Group(peer_id) => Self::Group(peer_id),
+            LeafId::Doc(doc_id) => Self::Doc(doc_id),
         }
     }
+}
+
+enum LeafEvent {
+    Stop,
+    CreateDoc(oneshot::Sender<LeafResponse>, Commit, Vec<LeafId>),
+}
+
+enum LeafResponse {
+    CreateDoc(Result<DocumentId>),
 }
 
 impl Leaf {
@@ -79,15 +93,16 @@ impl Leaf {
             task_queue.add_task(task);
         }
 
-        let (sender, receiver) = flume::unbounded();
+        let (event_tx, event_rx) = flume::unbounded();
         let leaf = Self {
             id: beelay.peer_id(),
-            events: sender,
+            events: event_tx,
         };
         let runner = LeafRunner {
             beelay,
             task_queue,
-            events: receiver.into_stream(),
+            events: event_rx.into_stream(),
+            command_event_id_map: HashMap::default(),
         };
 
         Ok((leaf, runner))
@@ -103,12 +118,33 @@ impl Leaf {
     pub fn stop(&self) {
         self.events.try_send(LeafEvent::Stop).ok();
     }
+
+    pub async fn create_doc(
+        &self,
+        commit: Commit,
+        other_owners: Vec<LeafId>,
+    ) -> Result<DocumentId> {
+        let (responder, response) = oneshot::channel();
+        self.events
+            .send(LeafEvent::CreateDoc(responder, commit, other_owners))
+            .ok();
+
+        #[allow(irrefutable_let_patterns)] // Temporary
+        if let LeafResponse::CreateDoc(doc_id) =
+            response.into_future().await.expect("channel error")
+        {
+            doc_id
+        } else {
+            panic!("Invalid response type")
+        }
+    }
 }
 
 pub struct LeafRunner<Io> {
     beelay: Beelay<ThreadRng>,
     task_queue: TaskQueue<Io>,
     events: RecvStream<'static, LeafEvent>,
+    command_event_id_map: HashMap<CommandId, oneshot::Sender<LeafResponse>>,
 }
 
 impl<Io: LeafIo> Future for LeafRunner<Io> {
@@ -122,22 +158,66 @@ impl<Io: LeafIo> Future for LeafRunner<Io> {
             beelay,
             task_queue,
             events,
+            command_event_id_map: command_responders,
         } = &mut *self;
         let now = UnixTimestampMillis::now;
 
-        let handle_beelay_result = |result: EventResults, task_queue: &mut TaskQueue<Io>| {
+        let handle_beelay_result = |result: EventResults,
+                                    task_queue: &mut TaskQueue<Io>,
+                                    command_responders: &mut HashMap<
+            CommandId,
+            oneshot::Sender<LeafResponse>,
+        >| {
             for task in result.new_tasks {
                 task_queue.add_task(task);
+            }
+            for (id, command) in result.completed_commands {
+                // We ignore the case of a command that got interrupted because beelay is being stopped for now
+                let Ok(command) = command else { continue };
+                let Some(responder) = command_responders.remove(&id) else {
+                    continue;
+                };
+
+                match command {
+                    CommandResult::CreateDoc(document_id) => {
+                        responder
+                            .send(LeafResponse::CreateDoc(document_id.map_err(|e| e.into())))
+                            .ok();
+                    }
+                    CommandResult::AddCommits(bundle_specs) => {}
+                    CommandResult::AddBundle(_) => todo!(),
+                    CommandResult::LoadDoc(commit_or_bundles) => todo!(),
+                    CommandResult::CreateStream(stream_id) => todo!(),
+                    CommandResult::DisconnectStream => todo!(),
+                    CommandResult::HandleRequest(endpoint_response) => todo!(),
+                    CommandResult::HandleResponse => todo!(),
+                    CommandResult::RegisterEndpoint(endpoint_id) => todo!(),
+                    CommandResult::UnregisterEndpoint => todo!(),
+                    CommandResult::Keyhive(keyhive_command_result) => todo!(),
+                    CommandResult::QueryStatus(doc_status) => todo!(),
+                    CommandResult::Stop => (),
+                }
             }
         };
 
         // If there is a new leaf event ready, then send that to Beelay
         if let Poll::Ready(Some(event)) = events.poll_next_unpin(cx) {
-            match beelay.handle_event(now(), event.into()) {
+            let beelay_event = match event {
+                LeafEvent::Stop => Event::stop(),
+                LeafEvent::CreateDoc(responder, commit, keyhive_entity_ids) => {
+                    let (command, ev) = Event::create_doc(
+                        commit,
+                        keyhive_entity_ids.into_iter().map(Into::into).collect(),
+                    );
+                    command_responders.insert(command, responder);
+                    ev
+                }
+            };
+            match beelay.handle_event(now(), beelay_event) {
                 Ok(EventResults { stopped: true, .. }) | Err(Stopped) => {
                     return Poll::Ready(Ok(()));
                 }
-                Ok(result) => handle_beelay_result(result, task_queue),
+                Ok(result) => handle_beelay_result(result, task_queue, command_responders),
             }
         }
 
@@ -148,7 +228,7 @@ impl<Io: LeafIo> Future for LeafRunner<Io> {
                     Ok(EventResults { stopped: true, .. }) | Err(Stopped) => {
                         return Poll::Ready(Ok(()));
                     }
-                    Ok(result) => handle_beelay_result(result, task_queue),
+                    Ok(result) => handle_beelay_result(result, task_queue, command_responders),
                 },
                 Err(e) => tracing::error!("IO Error: {e}"),
             }
