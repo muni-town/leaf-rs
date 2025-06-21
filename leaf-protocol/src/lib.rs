@@ -1,259 +1,160 @@
+use flume::{Sender, r#async::RecvStream};
+use futures::StreamExt;
 use std::{
     collections::{HashMap, VecDeque},
     future::Future,
+    sync::Arc,
+    task::Poll,
 };
 
 pub use anyhow::Result;
 pub use beelay_core::StorageKey;
 use beelay_core::{
-    Beelay, Config, PeerId, UnixTimestampMillis,
+    Beelay, Config, Event, EventResults, PeerId, Stopped, UnixTimestampMillis,
     io::{IoAction, IoResult, IoTask},
     loading::Step,
 };
 pub use ed25519_dalek::Signature;
 use rand::rngs::ThreadRng;
 
-use crate::io::LeafIo;
+use crate::io::{IoTaskExt, LeafIo, TaskQueue};
 
-pub mod io {
-    use ed25519_dalek::VerifyingKey;
+pub mod io;
 
-    use crate::*;
+pub struct Leaf {
+    id: PeerId,
+    events: Sender<LeafEvent>,
+}
 
-    pub trait LeafIo {
-        fn load(&self, key: StorageKey) -> impl Future<Output = Result<Option<Vec<u8>>>> + Send;
-        fn load_range(
-            &self,
-            prefix: StorageKey,
-        ) -> impl Future<Output = Result<HashMap<StorageKey, Vec<u8>>>> + Send;
-        fn list_one_level(
-            &self,
-            prefix: StorageKey,
-        ) -> impl Future<Output = Result<Vec<StorageKey>>> + Send;
-        fn put(&self, key: StorageKey, data: Vec<u8>) -> impl Future<Output = Result<()>> + Send;
-        fn delete(&self, key: StorageKey) -> impl Future<Output = Result<()>>;
-        fn sign(&self, data: Vec<u8>) -> impl Future<Output = Result<Signature>>;
-        fn public_key(&self) -> VerifyingKey;
-    }
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum LeafEvent {
+    Stop,
+}
 
-    pub mod native {
-        use blocking::unblock;
-        use ed25519_dalek::{SigningKey, ed25519::signature::Signer};
-        use fjall::{Config, Keyspace, PartitionCreateOptions};
-        use smallvec::SmallVec;
-
-        use super::*;
-        use std::{collections::HashSet, path::Path};
-
-        const BEELAY_PREFIX: &[u8] = b"beelay_";
-        const SIGNING_KEY_KEY: &[u8] = b"signing_key";
-
-        pub struct NativeIo {
-            _keyspace: Keyspace,
-            signing_key: SigningKey,
-            partition: fjall::Partition,
-        }
-
-        impl NativeIo {
-            pub async fn open<P: AsRef<Path>>(data_dir: P) -> Result<Self> {
-                let config = Config::new(data_dir);
-                unblock(move || {
-                    let mut rng = rand::thread_rng();
-                    let keyspace = config.open()?;
-                    let partition =
-                        keyspace.open_partition("leaf", PartitionCreateOptions::default())?;
-
-                    let signing_key = if let Some(data) = partition.get(SIGNING_KEY_KEY)? {
-                        SigningKey::try_from(&data[..])?
-                    } else {
-                        let k = SigningKey::generate(&mut rng);
-                        partition.insert(SIGNING_KEY_KEY, k.to_bytes())?;
-                        k
-                    };
-
-                    Ok(NativeIo {
-                        _keyspace: keyspace,
-                        partition,
-                        signing_key,
-                    })
-                })
-                .await
-            }
-        }
-
-        trait StorageKeyExt {
-            fn to_bytes(&self) -> Vec<u8>;
-            fn from_bytes(bytes: &[u8]) -> Self;
-        }
-        impl StorageKeyExt for StorageKey {
-            fn to_bytes(&self) -> Vec<u8> {
-                let mut bytes = Vec::new();
-
-                // Add our prefix to mark beelay storage keys
-                bytes.extend_from_slice(BEELAY_PREFIX);
-
-                for component in self.components() {
-                    let len: u8 = component
-                        .len()
-                        .try_into()
-                        .expect("storage key path component longer than 255 bytes");
-                    bytes.push(len);
-                    bytes.extend_from_slice(component.as_bytes());
-                }
-                bytes
-            }
-
-            fn from_bytes(bytes: &[u8]) -> Self {
-                // Load the namespace
-                const ERR: &str = "Error parsing storage path component";
-                let mut strings = Vec::new();
-                let bytes = &mut bytes.iter().copied();
-
-                // Make sure the prefix matches our beelay storage prefix
-                assert_eq!(
-                    BEELAY_PREFIX,
-                    &bytes
-                        .take(BEELAY_PREFIX.len())
-                        .collect::<SmallVec<[u8; 7]>>()[..],
-                    "{}",
-                    ERR
-                );
-
-                loop {
-                    let Some(len) = bytes.next() else { break };
-                    let data = bytes.take(len as usize).collect::<Vec<_>>();
-                    strings.push(String::from_utf8(data).expect(ERR));
-                }
-                StorageKey::try_from(strings).expect(ERR)
-            }
-        }
-
-        impl LeafIo for NativeIo {
-            fn public_key(&self) -> VerifyingKey {
-                self.signing_key.verifying_key()
-            }
-
-            async fn load(&self, key: StorageKey) -> Result<Option<Vec<u8>>> {
-                let partition = self.partition.clone();
-                let key = key.to_bytes();
-                let data = unblock(move || partition.get(&key)).await?;
-                Ok(data.map(|x| x.to_vec()))
-            }
-
-            async fn load_range(&self, prefix: StorageKey) -> Result<HashMap<StorageKey, Vec<u8>>> {
-                let partition = self.partition.clone();
-                let prefix_bytes = prefix.to_bytes();
-                unblock(move || {
-                    let mut output = HashMap::new();
-                    for result in partition.prefix(&prefix_bytes) {
-                        let (key, value) = result?;
-                        let key = StorageKey::from_bytes(&key);
-                        if prefix.is_prefix_of(&key) {
-                            output.insert(key, value.to_vec());
-                        }
-                    }
-
-                    Ok(output)
-                })
-                .await
-            }
-
-            async fn list_one_level(&self, prefix: StorageKey) -> Result<Vec<StorageKey>> {
-                let partition = self.partition.clone();
-                let prefix_bytes = prefix.to_bytes();
-                unblock(move || {
-                    let mut output = HashSet::new();
-                    for result in partition.prefix(&prefix_bytes) {
-                        let (key, _value) = result?;
-                        let key = StorageKey::from_bytes(&key);
-                        if let Some(key) = key.onelevel_deeper(&prefix) {
-                            output.insert(key);
-                        }
-                    }
-                    Ok(output.into_iter().collect())
-                })
-                .await
-            }
-
-            async fn put(&self, key: StorageKey, data: Vec<u8>) -> Result<()> {
-                let partition = self.partition.clone();
-                let key = key.to_bytes();
-                unblock(move || partition.insert(key, data)).await?;
-                Ok(())
-            }
-
-            async fn delete(&self, key: StorageKey) -> Result<()> {
-                let partition = self.partition.clone();
-                let key = key.to_bytes();
-                unblock(move || partition.remove(key)).await?;
-                Ok(())
-            }
-
-            async fn sign(&self, data: Vec<u8>) -> Result<Signature> {
-                Ok(self.signing_key.sign(&data))
-            }
+impl From<LeafEvent> for beelay_core::Event {
+    fn from(val: LeafEvent) -> Self {
+        match val {
+            LeafEvent::Stop => Event::stop(),
         }
     }
 }
 
-pub struct Leaf<Io> {
-    io: Io,
-    beelay: Beelay<ThreadRng>,
-    task_queue: VecDeque<IoTask>,
-}
-
-impl<Io: LeafIo> Leaf<Io> {
-    pub async fn new(io: Io) -> Result<Self> {
+impl Leaf {
+    /// Instantiate a Leaf instance with the given IO adapter.
+    ///
+    /// This will return two types, the [`Leaf`] handle and the [`LeafRunner`]. The [`LeafRunner`]
+    /// is a future that must be [`await`]ed on in order for Leaf to process it's events. Usually
+    /// you will spawn this as an async task using your executor, or you will make it the last thing
+    /// that you `await` in your program. The future will resolve once the Leaf peer has been
+    /// stopped.
+    ///
+    /// > **⚠️ Important:** The returned [`LeafRunner`] is a [`Future`] not [`Sync`] or [`Send`] and
+    /// > must be awaited on the same thread that it was created on. The [`Leaf`] instance, on the
+    /// > other hand,  is a handle that can be cheaply cloned and is both [`Sync`] and [`Send`].
+    pub async fn new<Io: LeafIo>(io: Io) -> Result<(Self, LeafRunner<Io>)> {
+        let io = Arc::new(io);
         let now = UnixTimestampMillis::now;
         let rng = rand::thread_rng();
         let mut step = Beelay::load(Config::new(rng, io.public_key()), now());
 
-        let mut task_queue = VecDeque::new();
+        let mut startup_task_queue = VecDeque::new();
         let beelay = loop {
             match step {
                 Step::Loading(l, io_tasks) => {
-                    task_queue.extend(io_tasks);
-                    let next_task = task_queue.pop_front().unwrap();
-                    let id = next_task.id();
-
-                    let result = match next_task.take_action() {
-                        IoAction::Load { key } => IoResult::load(id, io.load(key).await?),
-                        IoAction::LoadRange { prefix } => {
-                            IoResult::load_range(id, io.load_range(prefix).await?)
-                        }
-                        IoAction::ListOneLevel { prefix } => {
-                            IoResult::list_one_level(id, io.list_one_level(prefix).await?)
-                        }
-                        IoAction::Put { key, data } => {
-                            io.put(key, data).await?;
-                            IoResult::put(id)
-                        }
-                        IoAction::Delete { key } => {
-                            io.delete(key).await?;
-                            IoResult::delete(id)
-                        }
-                        IoAction::Sign { payload } => IoResult::sign(id, io.sign(payload).await?),
-                    };
-
+                    startup_task_queue.extend(io_tasks);
+                    let next_task = startup_task_queue.pop_front().unwrap();
+                    let result = next_task.into_future(io.clone()).await?;
                     step = l.handle_io_complete(now(), result)
                 }
                 Step::Loaded(beelay, io_tasks) => {
-                    task_queue.extend(io_tasks);
+                    startup_task_queue.extend(io_tasks);
                     break beelay;
                 }
             }
         };
 
-        assert_eq!(task_queue.len(), 0);
+        let task_queue = TaskQueue::new(io.clone());
 
-        Ok(Self {
-            io,
+        for task in startup_task_queue.drain(..) {
+            task_queue.add_task(task);
+        }
+
+        let (sender, receiver) = flume::unbounded();
+        let leaf = Self {
+            id: beelay.peer_id(),
+            events: sender,
+        };
+        let runner = LeafRunner {
             beelay,
             task_queue,
-        })
+            events: receiver.into_stream(),
+        };
+
+        Ok((leaf, runner))
     }
 
+    /// Get the Leaf Peer ID.
     pub fn id(&self) -> PeerId {
-        self.beelay.peer_id()
+        self.id
+    }
+
+    /// Stop the leaf peer. This will cause [`run()`][Self::run] to return once the signal has been
+    /// processed.
+    pub fn stop(&self) {
+        self.events.try_send(LeafEvent::Stop).ok();
+    }
+}
+
+pub struct LeafRunner<Io> {
+    beelay: Beelay<ThreadRng>,
+    task_queue: TaskQueue<Io>,
+    events: RecvStream<'static, LeafEvent>,
+}
+
+impl<Io: LeafIo> Future for LeafRunner<Io> {
+    type Output = Result<()>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Self::Output> {
+        let Self {
+            beelay,
+            task_queue,
+            events,
+        } = &mut *self;
+        let now = UnixTimestampMillis::now;
+
+        let handle_beelay_result = |result: EventResults, task_queue: &mut TaskQueue<Io>| {
+            for task in result.new_tasks {
+                task_queue.add_task(task);
+            }
+        };
+
+        // If there is a new leaf event ready, then send that to Beelay
+        if let Poll::Ready(Some(event)) = events.poll_next_unpin(cx) {
+            match beelay.handle_event(now(), event.into()) {
+                Ok(EventResults { stopped: true, .. }) | Err(Stopped) => {
+                    return Poll::Ready(Ok(()));
+                }
+                Ok(result) => handle_beelay_result(result, task_queue),
+            }
+        }
+
+        // If there is an IO result ready, then send that to Beelay, too
+        if let Poll::Ready(Some(io_result)) = task_queue.poll_next_unpin(cx) {
+            match io_result {
+                Ok(io_result) => match beelay.handle_event(now(), Event::io_complete(io_result)) {
+                    Ok(EventResults { stopped: true, .. }) | Err(Stopped) => {
+                        return Poll::Ready(Ok(()));
+                    }
+                    Ok(result) => handle_beelay_result(result, task_queue),
+                },
+                Err(e) => tracing::error!("IO Error: {e}"),
+            }
+        }
+
+        // Keep going forever until we get a stop result from Beelay
+        Poll::Pending
     }
 }
