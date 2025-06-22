@@ -1,3 +1,14 @@
+use crate::Result;
+
+pub use beelay_core::{Commit, CommitOrBundle};
+
+pub trait Document: Sized {
+    fn initial_commit() -> Commit;
+    fn from_raw(chunks: Vec<CommitOrBundle>) -> Result<Self>;
+    fn add_commits(&self, chunks: Vec<CommitOrBundle>) -> Result<()>;
+    fn subscribe_to_commits(&self, callback: Box<dyn Fn(Commit) + Sync + Send + 'static>);
+}
+
 #[cfg(feature = "automerge")]
 mod automerge {
     use crate::Result;
@@ -6,7 +17,7 @@ mod automerge {
     use automerge::transaction::CommitOptions;
     use beelay_core::CommitHash;
 
-    use crate::Document;
+    use super::Document;
 
     impl Document for Automerge {
         fn initial_commit() -> beelay_core::Commit {
@@ -44,7 +55,7 @@ mod loro {
     use beelay_core::{CommitHash, CommitOrBundle};
     use loro::LoroDoc;
 
-    use crate::Document;
+    use super::Document;
 
     impl Document for LoroDoc {
         fn initial_commit() -> beelay_core::Commit {

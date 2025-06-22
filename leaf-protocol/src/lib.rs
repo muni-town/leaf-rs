@@ -27,10 +27,8 @@ pub use loro;
 
 pub mod io;
 
-pub mod doc;
-
-pub use commit::*;
-mod commit;
+pub use doc::*;
+mod doc;
 
 #[derive(Clone)]
 pub struct Leaf<Doc> {
