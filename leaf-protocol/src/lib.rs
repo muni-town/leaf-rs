@@ -3,30 +3,40 @@ use futures::StreamExt;
 use std::{
     collections::{HashMap, VecDeque},
     future::Future,
+    marker::PhantomData,
     sync::Arc,
     task::Poll,
 };
 
 pub use anyhow::Result;
-pub use beelay_core::StorageKey;
 use beelay_core::{
-    Beelay, CommandId, CommandResult, Commit, CommitOrBundle, Config, DocumentId, Event,
-    EventResults, PeerId, Stopped, UnixTimestampMillis,
+    Beelay, CommandId, CommandResult, Config, DocumentId, Event, EventResults, PeerId, Stopped,
+    UnixTimestampMillis,
     io::{IoAction, IoResult, IoTask},
     keyhive::KeyhiveEntityId,
     loading::Step,
 };
+pub use beelay_core::{Commit as RawCommit, CommitOrBundle as RawCommitOrBundle, StorageKey};
 pub use ed25519_dalek::Signature;
 use rand::rngs::ThreadRng;
 
 use crate::io::{IoTaskExt, LeafIo, TaskQueue};
 
+#[cfg(feature = "loro")]
+pub use loro;
+
 pub mod io;
 
+pub mod doc;
+
+pub use commit::*;
+mod commit;
+
 #[derive(Clone)]
-pub struct Leaf {
+pub struct Leaf<Doc> {
     id: PeerId,
     events: Sender<LeafEvent>,
+    _phantom: PhantomData<Doc>,
 }
 
 pub enum LeafId {
@@ -47,16 +57,16 @@ impl From<LeafId> for KeyhiveEntityId {
 
 enum LeafEvent {
     Stop,
-    CreateDoc(oneshot::Sender<LeafResponse>, Commit, Vec<LeafId>),
+    CreateDoc(oneshot::Sender<LeafResponse>, RawCommit, Vec<LeafId>),
     LoadDoc(oneshot::Sender<LeafResponse>, DocumentId),
 }
 
 enum LeafResponse {
     CreateDoc(Result<DocumentId>),
-    LoadDoc(Option<Vec<CommitOrBundle>>),
+    LoadDoc(Option<Vec<RawCommitOrBundle>>),
 }
 
-impl Leaf {
+impl<Doc: Document> Leaf<Doc> {
     /// Instantiate a Leaf instance with the given IO adapter.
     ///
     /// This will return two types, the [`Leaf`] handle and the [`LeafRunner`]. The [`LeafRunner`]
@@ -100,6 +110,7 @@ impl Leaf {
         let leaf = Self {
             id: beelay.peer_id(),
             events: event_tx,
+            _phantom: PhantomData,
         };
         let runner = LeafRunner {
             beelay,
@@ -123,14 +134,14 @@ impl Leaf {
     }
 
     /// Create a new document
-    pub async fn create_doc(
-        &self,
-        commit: Commit,
-        other_owners: Vec<LeafId>,
-    ) -> Result<DocumentId> {
+    pub async fn create_doc(&self, other_owners: Vec<LeafId>) -> Result<DocumentId> {
         let (responder, response) = oneshot::channel();
         self.events
-            .send(LeafEvent::CreateDoc(responder, commit, other_owners))
+            .send(LeafEvent::CreateDoc(
+                responder,
+                Doc::initial_commit(),
+                other_owners,
+            ))
             .ok();
 
         if let LeafResponse::CreateDoc(doc_id) =
@@ -143,13 +154,13 @@ impl Leaf {
     }
 
     /// Load a document
-    pub async fn load_doc(&self, doc_id: DocumentId) -> Option<Vec<CommitOrBundle>> {
+    pub async fn load_doc(&self, doc_id: DocumentId) -> Result<Option<Doc>> {
         let (responder, response) = oneshot::channel();
         self.events.send(LeafEvent::LoadDoc(responder, doc_id)).ok();
 
-        if let LeafResponse::LoadDoc(doc_id) = response.into_future().await.expect("channel error")
+        if let LeafResponse::LoadDoc(chunks) = response.into_future().await.expect("channel error")
         {
-            doc_id
+            chunks.map(|chunks| Doc::from_raw(chunks)).transpose()
         } else {
             panic!("Invalid response type")
         }

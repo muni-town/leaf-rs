@@ -2,13 +2,14 @@ use std::str::FromStr;
 
 use beelay_core::DocumentId;
 use leaf_protocol::{io::native::NativeIo, *};
+use loro::LoroDoc;
 
 #[async_std::main]
 async fn main() -> Result<()> {
     // Create a native IO adapter that stores its data in a local filesystem directory.
     let io = NativeIo::open("./data.gitignore").await?;
     // Create a leaf instance and its "runner" that is used to drive the async event loop.
-    let (leaf, runner) = Leaf::new(io).await?;
+    let (leaf, runner) = Leaf::<LoroDoc>::new(io).await?;
 
     // Print the peer ID which is persisted across starts by storing the private key in the
     // data store.
