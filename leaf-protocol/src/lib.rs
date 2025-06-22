@@ -205,16 +205,16 @@ impl<Io: LeafIo> Future for LeafRunner<Io> {
                             .send(LeafResponse::LoadDoc(commit_or_bundles))
                             .ok();
                     }
-                    CommandResult::AddCommits(bundle_specs) => {}
+                    CommandResult::AddCommits(_bundle_specs) => {}
                     CommandResult::AddBundle(_) => todo!(),
-                    CommandResult::CreateStream(stream_id) => todo!(),
+                    CommandResult::CreateStream(_stream_id) => todo!(),
                     CommandResult::DisconnectStream => todo!(),
-                    CommandResult::HandleRequest(endpoint_response) => todo!(),
+                    CommandResult::HandleRequest(_endpoint_response) => todo!(),
                     CommandResult::HandleResponse => todo!(),
-                    CommandResult::RegisterEndpoint(endpoint_id) => todo!(),
+                    CommandResult::RegisterEndpoint(_endpoint_id) => todo!(),
                     CommandResult::UnregisterEndpoint => todo!(),
-                    CommandResult::Keyhive(keyhive_command_result) => todo!(),
-                    CommandResult::QueryStatus(doc_status) => todo!(),
+                    CommandResult::Keyhive(_keyhive_command_result) => todo!(),
+                    CommandResult::QueryStatus(_doc_status) => todo!(),
                     CommandResult::Stop => (),
                 }
             }

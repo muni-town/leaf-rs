@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.98"
+async-std = { version = "1.13.1", features = ["async-attributes", "attributes"] }
 automerge = "0.6.1"
 beelay-core = { git = "https://github.com/inkandswitch/keyhive.git", version = "0.1.0" }
 blake3 = "1.8.2"
@@ -18,6 +19,7 @@ loro = "1.5.9"
 oneshot = "0.1.11"
 rand = "0.8.0"
 smallvec = "1.15.1"
+smol = "2.0.2"
 tracing = "0.1.41"
 
 [dev-dependencies]
