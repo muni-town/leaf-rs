@@ -9,6 +9,9 @@ loro = ["dep:loro"]
 automerge = ["dep:automerge"]
 
 [dependencies]
+automerge = { version = "0.6.1", optional = true }
+loro = { version = "1.5.9", optional = true }
+
 anyhow = "1.0.98"
 async-std = { version = "1.13.1", features = [
     "async-attributes",
@@ -27,9 +30,8 @@ rand = "0.8.0"
 smallvec = "1.15.1"
 smol = "2.0.2"
 tracing = "0.1.41"
-
-automerge = { version = "0.6.1", optional = true }
-loro = { version = "1.5.9", optional = true }
+miniz_oxide = "0.8.9"
+parking_lot = "0.12.4"
 
 [dev-dependencies]
 tokio = { version = "1.45.1", features = ["macros", "rt-multi-thread", "time"] }

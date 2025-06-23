@@ -16,7 +16,7 @@ use beelay_core::{
     keyhive::KeyhiveEntityId,
     loading::Step,
 };
-pub use beelay_core::{Commit as RawCommit, CommitOrBundle as RawCommitOrBundle, StorageKey};
+pub use beelay_core::{Commit, CommitOrBundle, StorageKey};
 pub use ed25519_dalek::Signature;
 use rand::rngs::ThreadRng;
 
@@ -30,11 +30,20 @@ pub mod io;
 pub use doc::*;
 mod doc;
 
-#[derive(Clone)]
 pub struct Leaf<Doc> {
     id: PeerId,
     events: Sender<LeafEvent>,
     _phantom: PhantomData<Doc>,
+}
+
+impl<T> Clone for Leaf<T> {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            events: self.events.clone(),
+            _phantom: self._phantom,
+        }
+    }
 }
 
 pub enum LeafId {
@@ -55,13 +64,14 @@ impl From<LeafId> for KeyhiveEntityId {
 
 enum LeafEvent {
     Stop,
-    CreateDoc(oneshot::Sender<LeafResponse>, RawCommit, Vec<LeafId>),
+    CreateDoc(oneshot::Sender<LeafResponse>, Commit, Vec<LeafId>),
     LoadDoc(oneshot::Sender<LeafResponse>, DocumentId),
+    AddCommits(DocumentId, Vec<Commit>),
 }
 
 enum LeafResponse {
     CreateDoc(Result<DocumentId>),
-    LoadDoc(Option<Vec<RawCommitOrBundle>>),
+    LoadDoc(Option<Vec<CommitOrBundle>>),
 }
 
 impl<Doc: Document> Leaf<Doc> {
@@ -155,10 +165,22 @@ impl<Doc: Document> Leaf<Doc> {
     pub async fn load_doc(&self, doc_id: DocumentId) -> Result<Option<Doc>> {
         let (responder, response) = oneshot::channel();
         self.events.send(LeafEvent::LoadDoc(responder, doc_id)).ok();
+        let events = self.events.clone();
 
         if let LeafResponse::LoadDoc(chunks) = response.into_future().await.expect("channel error")
         {
-            chunks.map(|chunks| Doc::from_raw(chunks)).transpose()
+            chunks
+                .map(|chunks| {
+                    let doc = Doc::from_raw(chunks)?;
+                    let events_ = events.clone();
+                    doc.subscribe_to_commits(Box::new(move |commit| {
+                        events_
+                            .send(LeafEvent::AddCommits(doc_id, vec![commit]))
+                            .ok();
+                    }));
+                    Ok(doc)
+                })
+                .transpose()
         } else {
             panic!("Invalid response type")
         }
@@ -244,6 +266,10 @@ impl<Io: LeafIo> Future for LeafRunner<Io> {
                 LeafEvent::LoadDoc(responder, doc_id) => {
                     let (command, ev) = Event::load_doc(doc_id);
                     command_responders.insert(command, responder);
+                    ev
+                }
+                LeafEvent::AddCommits(doc_id, commits) => {
+                    let (_command, ev) = Event::add_commits(doc_id, commits);
                     ev
                 }
             };
