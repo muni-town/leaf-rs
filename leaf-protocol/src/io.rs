@@ -1,17 +1,12 @@
 use ed25519_dalek::VerifyingKey;
 
-use crate::*;
-
-pub use task_queue::*;
+use crate::{job_queue::IntoJob, *};
 
 pub mod native;
-mod task_queue;
 
-pub trait IoTaskExt<Io: LeafIo> {
-    fn into_future(self, io: Arc<Io>) -> impl Future<Output = Result<IoResult>> + Sync + Send;
-}
-impl<Io: LeafIo> IoTaskExt<Io> for IoTask {
-    async fn into_future(self, io: Arc<Io>) -> Result<IoResult> {
+impl<Io: LeafIo> IntoJob<Arc<Io>, Result<IoResult>> for IoTask {
+    async fn into_job(self, io: Arc<Io>) -> Result<IoResult> {
+        let io = io.clone();
         let id = self.id();
         let result = match self.take_action() {
             IoAction::Load { key } => IoResult::load(id, io.load(key).await?),

@@ -20,12 +20,13 @@ pub use beelay_core::{Commit, CommitOrBundle, StorageKey};
 pub use ed25519_dalek::Signature;
 use rand::rngs::ThreadRng;
 
-use crate::io::{IoTaskExt, LeafIo, TaskQueue};
+use crate::{io::LeafIo, job_queue::{IntoJob, JobQueue}};
 
 #[cfg(feature = "loro")]
 pub use loro;
 
 pub mod io;
+mod job_queue;
 
 pub use doc::*;
 mod doc;
@@ -97,8 +98,8 @@ impl<Doc: Document> Leaf<Doc> {
             match step {
                 Step::Loading(l, io_tasks) => {
                     startup_task_queue.extend(io_tasks);
-                    let next_task = startup_task_queue.pop_front().unwrap();
-                    let result = next_task.into_future(io.clone()).await?;
+                    let next_job = startup_task_queue.pop_front().unwrap();
+                    let result = next_job.into_job(io.clone()).await?;
                     step = l.handle_io_complete(now(), result)
                 }
                 Step::Loaded(beelay, io_tasks) => {
@@ -108,10 +109,10 @@ impl<Doc: Document> Leaf<Doc> {
             }
         };
 
-        let task_queue = TaskQueue::new(io.clone());
+        let task_queue = JobQueue::new(io.clone());
 
         for task in startup_task_queue.drain(..) {
-            task_queue.add_task(task);
+            task_queue.add_job(task);
         }
 
         let (event_tx, event_rx) = flume::unbounded();
@@ -189,11 +190,10 @@ impl<Doc: Document> Leaf<Doc> {
 
 pub struct LeafRunner<Io> {
     beelay: Beelay<ThreadRng>,
-    task_queue: TaskQueue<Io>,
+    task_queue: JobQueue<IoTask, Arc<Io>, Result<IoResult>>,
     events: RecvStream<'static, LeafEvent>,
     command_event_id_map: HashMap<CommandId, oneshot::Sender<LeafResponse>>,
 }
-
 impl<Io: LeafIo> Future for LeafRunner<Io> {
     type Output = Result<()>;
 
@@ -210,13 +210,17 @@ impl<Io: LeafIo> Future for LeafRunner<Io> {
         let now = UnixTimestampMillis::now;
 
         let handle_beelay_result = |result: EventResults,
-                                    task_queue: &mut TaskQueue<Io>,
+                                    task_queue: &mut JobQueue<
+            IoTask,
+            Arc<Io>,
+            Result<IoResult>,
+        >,
                                     command_responders: &mut HashMap<
             CommandId,
             oneshot::Sender<LeafResponse>,
         >| {
-            for task in result.new_tasks {
-                task_queue.add_task(task);
+            for job in result.new_tasks {
+                task_queue.add_job(job);
             }
             for (id, command) in result.completed_commands {
                 // We ignore the case of a command that got interrupted because beelay is being stopped for now
@@ -236,7 +240,12 @@ impl<Io: LeafIo> Future for LeafRunner<Io> {
                             .send(LeafResponse::LoadDoc(commit_or_bundles))
                             .ok();
                     }
-                    CommandResult::AddCommits(_bundle_specs) => {}
+                    CommandResult::AddCommits(bundle_specs) => match bundle_specs {
+                        Ok(new_bundles_eeded) => for bundle_spec in new_bundles_eeded {},
+                        Err(e) => {
+                            tracing::error!("Could not add commits, data will be lost: {e}");
+                        }
+                    },
                     CommandResult::AddBundle(_) => todo!(),
                     CommandResult::CreateStream(_stream_id) => todo!(),
                     CommandResult::DisconnectStream => todo!(),

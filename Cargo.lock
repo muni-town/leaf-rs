@@ -1374,7 +1374,6 @@ dependencies = [
  "beelay-core",
  "blake3",
  "blocking",
- "concurrent-queue",
  "ed25519-dalek",
  "fjall",
  "flume",
