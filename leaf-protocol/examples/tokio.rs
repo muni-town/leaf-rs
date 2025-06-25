@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use automerge::{ObjId, ReadDoc, ScalarValue, Value, transaction::Transactable};
+use automerge::{ObjId, ReadDoc, ScalarValue, transaction::Transactable};
 use beelay_core::DocumentId;
 use leaf_protocol::{io::native::NativeIo, *};
 
@@ -37,7 +37,6 @@ async fn main() -> Result<()> {
                         .unwrap();
 
                         let age = doc.get(ObjId::Root, "age")?;
-
                         dbg!(&age.map(|x| x.0));
 
                         Ok::<_, anyhow::Error>(())

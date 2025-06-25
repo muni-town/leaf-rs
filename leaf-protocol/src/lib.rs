@@ -1,35 +1,34 @@
-use flume::{Sender, r#async::RecvStream};
-use futures::StreamExt;
+use flume::Sender;
 use std::{
     collections::{HashMap, VecDeque},
     future::Future,
     marker::PhantomData,
     sync::Arc,
-    task::Poll,
 };
 
 pub use anyhow::Result;
 use beelay_core::{
-    Beelay, CommandId, CommandResult, Config, DocumentId, Event, EventResults, PeerId, Stopped,
-    UnixTimestampMillis,
-    io::{IoAction, IoResult, IoTask},
-    keyhive::KeyhiveEntityId,
-    loading::Step,
+    Beelay, Config, DocumentId, PeerId, UnixTimestampMillis, doc_status::DocStatus,
+    keyhive::KeyhiveEntityId, loading::Step,
 };
 pub use beelay_core::{Commit, CommitOrBundle, StorageKey};
 pub use ed25519_dalek::Signature;
-use rand::rngs::ThreadRng;
 
-use crate::{io::LeafIo, job_queue::{IntoJob, JobQueue}};
+use crate::{
+    io::LeafIo,
+    job_queue::{IntoJob, JobQueue},
+    runner::{LeafJob, LeafJobResult, LeafRunner},
+};
 
 #[cfg(feature = "loro")]
 pub use loro;
 
+mod doc;
 pub mod io;
 mod job_queue;
+mod runner;
 
 pub use doc::*;
-mod doc;
 
 pub struct Leaf<Doc> {
     id: PeerId,
@@ -63,16 +62,20 @@ impl From<LeafId> for KeyhiveEntityId {
     }
 }
 
+/// An event that is sent from the leaf handle to the leaf runner
 enum LeafEvent {
     Stop,
     CreateDoc(oneshot::Sender<LeafResponse>, Commit, Vec<LeafId>),
     LoadDoc(oneshot::Sender<LeafResponse>, DocumentId),
+    DocStatus(oneshot::Sender<LeafResponse>, DocumentId),
     AddCommits(DocumentId, Vec<Commit>),
 }
 
+/// A response that is sent from the leaf runner to the leaf handle
 enum LeafResponse {
     CreateDoc(Result<DocumentId>),
     LoadDoc(Option<Vec<CommitOrBundle>>),
+    DocStatus(DocStatus),
 }
 
 impl<Doc: Document> Leaf<Doc> {
@@ -88,18 +91,26 @@ impl<Doc: Document> Leaf<Doc> {
     /// > must be awaited on the same thread that it was created on. The [`Leaf`] instance, on the
     /// > other hand,  is a handle that can be cheaply cloned and is both [`Sync`] and [`Send`].
     pub async fn new<Io: LeafIo>(io: Io) -> Result<(Self, LeafRunner<Io>)> {
-        let io = Arc::new(io);
         let now = UnixTimestampMillis::now;
+        let io = Arc::new(io);
         let rng = rand::thread_rng();
+
+        // Start loading the Beelay instance
         let mut step = Beelay::load(Config::new(rng, io.public_key()), now());
 
+        // Create a queue for the startup tasks
         let mut startup_task_queue = VecDeque::new();
+
+        // Keep looping and executing the startup tasks until the Beelay instance has finished loading.
         let beelay = loop {
             match step {
                 Step::Loading(l, io_tasks) => {
                     startup_task_queue.extend(io_tasks);
-                    let next_job = startup_task_queue.pop_front().unwrap();
-                    let result = next_job.into_job(io.clone()).await?;
+                    let next_job = LeafJob::IoTask(startup_task_queue.pop_front().unwrap());
+                    let LeafJobResult::IoResult(result) = next_job.into_job(io.clone()).await?
+                    else {
+                        unreachable!("Invalid result")
+                    };
                     step = l.handle_io_complete(now(), result)
                 }
                 Step::Loaded(beelay, io_tasks) => {
@@ -109,18 +120,25 @@ impl<Doc: Document> Leaf<Doc> {
             }
         };
 
+        // Create our runtime task queue
         let task_queue = JobQueue::new(io.clone());
 
+        // Add any tasks remaining after startup to the runtime queue
         for task in startup_task_queue.drain(..) {
-            task_queue.add_job(task);
+            task_queue.add_job(LeafJob::IoTask(task));
         }
 
+        // Create the event channel
         let (event_tx, event_rx) = flume::unbounded();
+
+        // Create the leaf handle
         let leaf = Self {
             id: beelay.peer_id(),
             events: event_tx,
             _phantom: PhantomData,
         };
+
+        // Create a runner to execute the leaf event loop
         let runner = LeafRunner {
             beelay,
             task_queue,
@@ -186,124 +204,19 @@ impl<Doc: Document> Leaf<Doc> {
             panic!("Invalid response type")
         }
     }
-}
 
-pub struct LeafRunner<Io> {
-    beelay: Beelay<ThreadRng>,
-    task_queue: JobQueue<IoTask, Arc<Io>, Result<IoResult>>,
-    events: RecvStream<'static, LeafEvent>,
-    command_event_id_map: HashMap<CommandId, oneshot::Sender<LeafResponse>>,
-}
-impl<Io: LeafIo> Future for LeafRunner<Io> {
-    type Output = Result<()>;
+    pub async fn doc_status(&self, doc_id: DocumentId) -> DocStatus {
+        let (responder, response) = oneshot::channel();
+        self.events
+            .send(LeafEvent::DocStatus(responder, doc_id))
+            .ok();
 
-    fn poll(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<Self::Output> {
-        let Self {
-            beelay,
-            task_queue,
-            events,
-            command_event_id_map: command_responders,
-        } = &mut *self;
-        let now = UnixTimestampMillis::now;
-
-        let handle_beelay_result = |result: EventResults,
-                                    task_queue: &mut JobQueue<
-            IoTask,
-            Arc<Io>,
-            Result<IoResult>,
-        >,
-                                    command_responders: &mut HashMap<
-            CommandId,
-            oneshot::Sender<LeafResponse>,
-        >| {
-            for job in result.new_tasks {
-                task_queue.add_job(job);
-            }
-            for (id, command) in result.completed_commands {
-                // We ignore the case of a command that got interrupted because beelay is being stopped for now
-                let Ok(command) = command else { continue };
-                let Some(responder) = command_responders.remove(&id) else {
-                    continue;
-                };
-
-                match command {
-                    CommandResult::CreateDoc(document_id) => {
-                        responder
-                            .send(LeafResponse::CreateDoc(document_id.map_err(|e| e.into())))
-                            .ok();
-                    }
-                    CommandResult::LoadDoc(commit_or_bundles) => {
-                        responder
-                            .send(LeafResponse::LoadDoc(commit_or_bundles))
-                            .ok();
-                    }
-                    CommandResult::AddCommits(bundle_specs) => match bundle_specs {
-                        Ok(new_bundles_eeded) => for bundle_spec in new_bundles_eeded {},
-                        Err(e) => {
-                            tracing::error!("Could not add commits, data will be lost: {e}");
-                        }
-                    },
-                    CommandResult::AddBundle(_) => todo!(),
-                    CommandResult::CreateStream(_stream_id) => todo!(),
-                    CommandResult::DisconnectStream => todo!(),
-                    CommandResult::HandleRequest(_endpoint_response) => todo!(),
-                    CommandResult::HandleResponse => todo!(),
-                    CommandResult::RegisterEndpoint(_endpoint_id) => todo!(),
-                    CommandResult::UnregisterEndpoint => todo!(),
-                    CommandResult::Keyhive(_keyhive_command_result) => todo!(),
-                    CommandResult::QueryStatus(_doc_status) => todo!(),
-                    CommandResult::Stop => (),
-                }
-            }
-        };
-
-        // If there is a new leaf event ready, then send that to Beelay
-        if let Poll::Ready(Some(event)) = events.poll_next_unpin(cx) {
-            let beelay_event = match event {
-                LeafEvent::Stop => Event::stop(),
-                LeafEvent::CreateDoc(responder, commit, keyhive_entity_ids) => {
-                    let (command, ev) = Event::create_doc(
-                        commit,
-                        keyhive_entity_ids.into_iter().map(Into::into).collect(),
-                    );
-                    command_responders.insert(command, responder);
-                    ev
-                }
-                LeafEvent::LoadDoc(responder, doc_id) => {
-                    let (command, ev) = Event::load_doc(doc_id);
-                    command_responders.insert(command, responder);
-                    ev
-                }
-                LeafEvent::AddCommits(doc_id, commits) => {
-                    let (_command, ev) = Event::add_commits(doc_id, commits);
-                    ev
-                }
-            };
-            match beelay.handle_event(now(), beelay_event) {
-                Ok(EventResults { stopped: true, .. }) | Err(Stopped) => {
-                    return Poll::Ready(Ok(()));
-                }
-                Ok(result) => handle_beelay_result(result, task_queue, command_responders),
-            }
+        if let LeafResponse::DocStatus(status) =
+            response.into_future().await.expect("channel error")
+        {
+            status
+        } else {
+            panic!("Invalid response type")
         }
-
-        // If there is an IO result ready, then send that to Beelay, too
-        if let Poll::Ready(Some(io_result)) = task_queue.poll_next_unpin(cx) {
-            match io_result {
-                Ok(io_result) => match beelay.handle_event(now(), Event::io_complete(io_result)) {
-                    Ok(EventResults { stopped: true, .. }) | Err(Stopped) => {
-                        return Poll::Ready(Ok(()));
-                    }
-                    Ok(result) => handle_beelay_result(result, task_queue, command_responders),
-                },
-                Err(e) => tracing::error!("IO Error: {e}"),
-            }
-        }
-
-        // Keep going forever until we get a stop result from Beelay
-        Poll::Pending
     }
 }
