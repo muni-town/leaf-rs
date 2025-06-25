@@ -8,8 +8,7 @@ use std::{
 
 pub use anyhow::Result;
 use beelay_core::{
-    Beelay, Config, DocumentId, PeerId, UnixTimestampMillis, doc_status::DocStatus,
-    keyhive::KeyhiveEntityId, loading::Step,
+    doc_status::DocStatus, keyhive::KeyhiveEntityId, loading::Step, Beelay, CommitBundle, Config, DocumentId, PeerId, UnixTimestampMillis
 };
 pub use beelay_core::{Commit, CommitOrBundle, StorageKey};
 pub use ed25519_dalek::Signature;
@@ -69,6 +68,7 @@ enum LeafEvent {
     LoadDoc(oneshot::Sender<LeafResponse>, DocumentId),
     DocStatus(oneshot::Sender<LeafResponse>, DocumentId),
     AddCommits(DocumentId, Vec<Commit>),
+    AddBundle(DocumentId, CommitBundle),
 }
 
 /// A response that is sent from the leaf runner to the leaf handle
@@ -134,7 +134,7 @@ impl<Doc: Document> Leaf<Doc> {
         // Create the leaf handle
         let leaf = Self {
             id: beelay.peer_id(),
-            events: event_tx,
+            events: event_tx.clone(),
             _phantom: PhantomData,
         };
 
@@ -142,7 +142,8 @@ impl<Doc: Document> Leaf<Doc> {
         let runner = LeafRunner {
             beelay,
             task_queue,
-            events: event_rx.into_stream(),
+            event_rx: event_rx.into_stream(),
+            event_tx,
             command_event_id_map: HashMap::default(),
         };
 

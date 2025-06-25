@@ -1,5 +1,6 @@
 use crate::Result;
 
+use beelay_core::{BundleSpec, CommitBundle};
 pub use beelay_core::{Commit, CommitOrBundle};
 
 pub type DocumentSubscriber = Box<dyn Fn(beelay_core::Commit) + Sync + Send + 'static>;
@@ -7,6 +8,7 @@ pub trait Document: Default + Sized {
     fn initial_commit() -> Commit;
     fn add_commits(&self, chunks: Vec<CommitOrBundle>) -> Result<()>;
     fn subscribe_to_commits(&self, callback: Box<dyn Fn(Commit) + Sync + Send + 'static>);
+    fn create_bundle(&self, bundle_spec: BundleSpec) -> CommitBundle;
 
     fn from_raw(chunks: Vec<CommitOrBundle>) -> Result<Self> {
         let doc = Self::default();
@@ -111,6 +113,10 @@ mod automerge {
         fn subscribe_to_commits(&self, callback: DocumentSubscriber) {
             self.inner.write().subscribers.push(callback);
         }
+
+        fn create_bundle(&self, bundle_spec: beelay_core::BundleSpec) -> beelay_core::CommitBundle {
+            todo!()
+        }
     }
 }
 
@@ -159,6 +165,10 @@ mod loro {
                 }
             }
             Ok(())
+        }
+
+        fn create_bundle(&self, bundle_spec: beelay_core::BundleSpec) -> beelay_core::CommitBundle {
+            todo!()
         }
     }
 }
