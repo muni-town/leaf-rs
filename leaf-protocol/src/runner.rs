@@ -1,55 +1,66 @@
 use flume::{Sender, r#async::RecvStream};
-use futures::StreamExt;
+use futures::{StreamExt, channel::oneshot};
 use std::{collections::HashMap, future::Future, sync::Arc, task::Poll};
 
 pub use anyhow::Result;
 use beelay_core::{
-    Beelay, BundleSpec, CommandId, CommandResult, CommitBundle, CommitOrBundle, DocumentId, Event,
-    EventResults, Stopped, UnixTimestampMillis,
+    Beelay, BundleSpec, CommandId, CommandResult, CommitBundle, DocumentId, Event, EventResults,
+    Stopped, UnixTimestampMillis,
     io::{IoAction, IoResult, IoTask},
 };
 use rand::rngs::ThreadRng;
 
 use crate::{
-    LeafEvent, LeafResponse,
+    Document, Leaf, LeafEvent, LeafResponse,
     io::LeafIo,
     job_queue::{IntoJob, JobQueue},
 };
 
-impl<Io: LeafIo> IntoJob<Arc<Io>, Result<LeafJobResult>> for LeafJob {
-    async fn into_job(self, io: Arc<Io>) -> Result<LeafJobResult> {
-        let io = io.clone();
+impl<Doc: Document, Io: LeafIo> IntoJob<Leaf<Doc, Io>, Result<LeafJobResult>> for LeafJob {
+    async fn into_job(self, leaf: Leaf<Doc, Io>) -> Result<LeafJobResult> {
         match self {
-            LeafJob::IoTask(io_task) => {
-                let id = io_task.id();
-
-                let result = match io_task.take_action() {
-                    IoAction::Load { key } => IoResult::load(id, io.load(key).await?),
-                    IoAction::LoadRange { prefix } => {
-                        IoResult::load_range(id, io.load_range(prefix).await?)
-                    }
-                    IoAction::ListOneLevel { prefix } => {
-                        IoResult::list_one_level(id, io.list_one_level(prefix).await?)
-                    }
-                    IoAction::Put { key, data } => {
-                        io.put(key, data).await?;
-                        IoResult::put(id)
-                    }
-                    IoAction::Delete { key } => {
-                        io.delete(key).await?;
-                        IoResult::delete(id)
-                    }
-                    IoAction::Sign { payload } => IoResult::sign(id, io.sign(payload).await?),
-                };
-
-                Ok(LeafJobResult::IoResult(result))
-            }
+            LeafJob::IoTask(io_task) => Ok(LeafJobResult::IoResult(
+                io_task.into_job(leaf.io.clone()).await?,
+            )),
             LeafJob::CreateBundles(bundle_specs) => {
-
-
-                Ok(LeafJobResult::CreateBundles(todo!()))
-            },
+                let mut bundles = Vec::with_capacity(bundle_specs.len());
+                for spec in bundle_specs {
+                    let doc_id = spec.doc;
+                    let Some(doc) = leaf.load_doc(spec.doc).await? else {
+                        continue;
+                    };
+                    let bundle = doc.create_bundle(spec);
+                    bundles.push((doc_id, bundle));
+                }
+                Ok(LeafJobResult::CreateBundles(bundles))
+            }
         }
+    }
+}
+impl<Io: LeafIo> IntoJob<Arc<Io>, Result<IoResult>> for IoTask {
+    async fn into_job(self, io: Arc<Io>) -> Result<IoResult> {
+        let id = self.id();
+
+        let result = match self.take_action() {
+            IoAction::Load { key } => IoResult::load(id, io.load(key).await?),
+            IoAction::LoadRange { prefix } => {
+                IoResult::load_range(id, io.load_range(prefix).await?)
+            }
+            IoAction::ListOneLevel { prefix } => {
+                IoResult::list_one_level(id, io.list_one_level(prefix).await?)
+            }
+            IoAction::Put { key, data } => {
+                io.put(key, data).await?;
+                IoResult::put(id)
+            }
+            IoAction::Delete { key } => {
+                io.delete(key).await?;
+                IoResult::delete(id)
+            }
+            IoAction::Sign { payload } => IoResult::sign(id, io.sign(payload).await?),
+        };
+
+        Ok(result)
     }
 }
 
@@ -62,14 +73,14 @@ pub enum LeafJobResult {
     CreateBundles(Vec<(DocumentId, CommitBundle)>),
 }
 
-pub struct LeafRunner<Io> {
-    pub(super) beelay: Beelay<ThreadRng>,
-    pub(super) task_queue: JobQueue<LeafJob, Arc<Io>, Result<LeafJobResult>>,
-    pub(super) event_rx: RecvStream<'static, LeafEvent>,
-    pub(super) event_tx: Sender<LeafEvent>,
-    pub(super) command_event_id_map: HashMap<CommandId, oneshot::Sender<LeafResponse>>,
+pub struct LeafRunner<Doc, Io> {
+    pub(crate) beelay: Beelay<ThreadRng>,
+    pub(crate) task_queue: JobQueue<LeafJob, Leaf<Doc, Io>, Result<LeafJobResult>>,
+    pub(crate) event_rx: RecvStream<'static, LeafEvent>,
+    pub(crate) event_tx: Sender<LeafEvent>,
+    pub(crate) command_event_id_map: HashMap<CommandId, oneshot::Sender<LeafResponse>>,
 }
-impl<Io: LeafIo> Future for LeafRunner<Io> {
+impl<Doc: Document, Io: LeafIo> Future for LeafRunner<Doc, Io> {
     type Output = Result<()>;
 
     fn poll(
@@ -103,6 +114,9 @@ impl<Io: LeafIo> Future for LeafRunner<Io> {
                     ev
                 }
                 LeafEvent::AddCommits(doc_id, commits) => {
+                    for commit in &commits {
+                        tracing::trace!(target: "test1", "{}, {:?}", &commit.hash(), &commit.parents());
+                    }
                     let (_command, ev) = Event::add_commits(doc_id, commits);
                     ev
                 }
@@ -151,9 +165,9 @@ impl<Io: LeafIo> Future for LeafRunner<Io> {
 }
 
 /// Helper function to handle the beelay [`EventResults`].
-fn handle_beelay_result<Io: LeafIo>(
+fn handle_beelay_result<Doc: Document, Io: LeafIo>(
     result: EventResults,
-    job_queue: &mut JobQueue<LeafJob, Arc<Io>, Result<LeafJobResult>>,
+    job_queue: &mut JobQueue<LeafJob, Leaf<Doc, Io>, Result<LeafJobResult>>,
     command_responders: &mut HashMap<CommandId, oneshot::Sender<LeafResponse>>,
 ) {
     for task in result.new_tasks {
@@ -177,12 +191,15 @@ fn handle_beelay_result<Io: LeafIo>(
                     .send(LeafResponse::LoadDoc(commit_or_bundles))
                     .ok();
             }
-            CommandResult::AddCommits(bundle_specs) => match bundle_specs {
-                Ok(bundle_specs) => job_queue.add_job(LeafJob::CreateBundles(bundle_specs)),
-                Err(e) => {
-                    tracing::error!("Could not add commits, data will be lost: {e}");
+            CommandResult::AddCommits(bundle_specs) => {
+                tracing::warn!("{:?}", bundle_specs);
+                match bundle_specs {
+                    Ok(bundle_specs) => job_queue.add_job(LeafJob::CreateBundles(bundle_specs)),
+                    Err(e) => {
+                        tracing::error!("Could not add commits, data will be lost: {e}");
+                    }
                 }
-            },
+            }
             CommandResult::AddBundle(result) => {
                 if let Err(e) = result {
                     tracing::error!("Error adding budne: {e}");

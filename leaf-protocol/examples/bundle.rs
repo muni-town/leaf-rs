@@ -6,6 +6,8 @@ use leaf_protocol::{io::native::NativeIo, *};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
+
     let doc_id = std::env::args()
         .nth(1)
         .map(|x| DocumentId::from_str(&x))
@@ -24,46 +26,27 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         let leaf_ = leaf.clone();
         let result = async move {
-            // Load doc if specified
-            if let Some(doc_id) = doc_id {
-                // You have to have created this doc first
-                let doc = leaf.load_doc(doc_id).await?;
-                if let Some(doc) = doc {
-                    doc.change(|doc| {
-                        doc.transact(|t| {
-                            t.increment(ObjId::Root, "age", 1).unwrap();
-                            Ok::<_, anyhow::Error>(())
-                        })
-                        .unwrap();
-
-                        let age = doc.get(ObjId::Root, "age")?;
-                        dbg!(&age.map(|x| x.0));
-
-                        Ok::<_, anyhow::Error>(())
-                    })?;
-                } else {
-                    anyhow::bail!("Doc not found")
-                }
-            } else {
-                let doc_id = leaf.create_doc(Vec::new()).await?;
-                dbg!(doc_id);
-                let doc = leaf.load_doc(doc_id).await?.unwrap();
-
+            let id = leaf.create_doc(Vec::new()).await?;
+            let doc = leaf.load_doc(id).await?.unwrap();
+            doc.change(|doc| {
+                doc.transact(|t| {
+                    t.put(ObjId::Root, "age", ScalarValue::counter(0))?;
+                    t.increment(ObjId::Root, "age", 1)?;
+                    Ok::<_, anyhow::Error>(())
+                })
+                .unwrap();
+            });
+            for _ in 0..100000 {
                 doc.change(|doc| {
                     doc.transact(|t| {
-                        t.put(ObjId::Root, "age", ScalarValue::counter(0))?;
-                        t.increment(ObjId::Root, "age", 1)?;
+                        t.increment(ObjId::Root, "age", 1).unwrap();
                         Ok::<_, anyhow::Error>(())
                     })
                     .unwrap();
 
-                    let age = doc.get(ObjId::Root, "age")?;
-
-                    dbg!(&age.map(|x| x.0));
-                    dbg!(doc.get_heads());
-
-                    Ok::<_, anyhow::Error>(())
-                })?;
+                    let age = doc.get(ObjId::Root, "age").unwrap();
+                    // dbg!(&age.map(|x| x.0));
+                });
             }
 
             Ok::<(), anyhow::Error>(())

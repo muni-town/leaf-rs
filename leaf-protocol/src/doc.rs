@@ -4,7 +4,7 @@ use beelay_core::{BundleSpec, CommitBundle};
 pub use beelay_core::{Commit, CommitOrBundle};
 
 pub type DocumentSubscriber = Box<dyn Fn(beelay_core::Commit) + Sync + Send + 'static>;
-pub trait Document: Default + Sized {
+pub trait Document: Clone + Default + Sync + Send + Sized + 'static {
     fn initial_commit() -> Commit;
     fn add_commits(&self, chunks: Vec<CommitOrBundle>) -> Result<()>;
     fn subscribe_to_commits(&self, callback: Box<dyn Fn(Commit) + Sync + Send + 'static>);
@@ -38,7 +38,11 @@ mod automerge {
 
     fn change_to_commit(change: &Change) -> Commit {
         Commit::new(
-            Vec::new(),
+            change
+                .deps()
+                .iter()
+                .map(|hash| CommitHash::from(hash.0))
+                .collect(),
             compress_to_vec(
                 change.raw_bytes(),
                 CompressionLevel::DefaultCompression as u8,
@@ -52,7 +56,7 @@ mod automerge {
         )?)
     }
 
-    #[derive(Default)]
+    #[derive(Default, Clone)]
     pub struct AutomergeDoc {
         inner: Arc<RwLock<AutomergeDocInner>>,
     }
@@ -115,7 +119,7 @@ mod automerge {
         }
 
         fn create_bundle(&self, bundle_spec: beelay_core::BundleSpec) -> beelay_core::CommitBundle {
-            todo!()
+            todo!("Not ready to make a bundle")
         }
     }
 }

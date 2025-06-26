@@ -1,4 +1,5 @@
 use flume::Sender;
+use futures::channel::oneshot;
 use std::{
     collections::{HashMap, VecDeque},
     future::Future,
@@ -8,7 +9,8 @@ use std::{
 
 pub use anyhow::Result;
 use beelay_core::{
-    doc_status::DocStatus, keyhive::KeyhiveEntityId, loading::Step, Beelay, CommitBundle, Config, DocumentId, PeerId, UnixTimestampMillis
+    Beelay, CommitBundle, Config, DocumentId, PeerId, UnixTimestampMillis, doc_status::DocStatus,
+    keyhive::KeyhiveEntityId, loading::Step,
 };
 pub use beelay_core::{Commit, CommitOrBundle, StorageKey};
 pub use ed25519_dalek::Signature;
@@ -16,7 +18,7 @@ pub use ed25519_dalek::Signature;
 use crate::{
     io::LeafIo,
     job_queue::{IntoJob, JobQueue},
-    runner::{LeafJob, LeafJobResult, LeafRunner},
+    runner::{LeafJob, LeafRunner},
 };
 
 #[cfg(feature = "loro")]
@@ -29,16 +31,19 @@ mod runner;
 
 pub use doc::*;
 
-pub struct Leaf<Doc> {
-    id: PeerId,
-    events: Sender<LeafEvent>,
-    _phantom: PhantomData<Doc>,
+pub struct Leaf<Doc, Io> {
+    pub(crate) io: Arc<Io>,
+    pub(crate) id: PeerId,
+    pub(crate) events: Sender<LeafEvent>,
+    pub(crate) _phantom: PhantomData<Doc>,
 }
+impl<Doc, Io> Unpin for Leaf<Doc, Io> {}
 
-impl<T> Clone for Leaf<T> {
+impl<T, Io> Clone for Leaf<T, Io> {
     fn clone(&self) -> Self {
         Self {
             id: self.id,
+            io: self.io.clone(),
             events: self.events.clone(),
             _phantom: self._phantom,
         }
@@ -78,7 +83,7 @@ enum LeafResponse {
     DocStatus(DocStatus),
 }
 
-impl<Doc: Document> Leaf<Doc> {
+impl<Doc: Document, Io: LeafIo> Leaf<Doc, Io> {
     /// Instantiate a Leaf instance with the given IO adapter.
     ///
     /// This will return two types, the [`Leaf`] handle and the [`LeafRunner`]. The [`LeafRunner`]
@@ -90,7 +95,7 @@ impl<Doc: Document> Leaf<Doc> {
     /// > **⚠️ Important:** The returned [`LeafRunner`] is a [`Future`] not [`Sync`] or [`Send`] and
     /// > must be awaited on the same thread that it was created on. The [`Leaf`] instance, on the
     /// > other hand,  is a handle that can be cheaply cloned and is both [`Sync`] and [`Send`].
-    pub async fn new<Io: LeafIo>(io: Io) -> Result<(Self, LeafRunner<Io>)> {
+    pub async fn new(io: Io) -> Result<(Self, LeafRunner<Doc, Io>)> {
         let now = UnixTimestampMillis::now;
         let io = Arc::new(io);
         let rng = rand::thread_rng();
@@ -106,11 +111,8 @@ impl<Doc: Document> Leaf<Doc> {
             match step {
                 Step::Loading(l, io_tasks) => {
                     startup_task_queue.extend(io_tasks);
-                    let next_job = LeafJob::IoTask(startup_task_queue.pop_front().unwrap());
-                    let LeafJobResult::IoResult(result) = next_job.into_job(io.clone()).await?
-                    else {
-                        unreachable!("Invalid result")
-                    };
+                    let next_job = startup_task_queue.pop_front().unwrap();
+                    let result = next_job.into_job(io.clone()).await?;
                     step = l.handle_io_complete(now(), result)
                 }
                 Step::Loaded(beelay, io_tasks) => {
@@ -120,23 +122,24 @@ impl<Doc: Document> Leaf<Doc> {
             }
         };
 
-        // Create our runtime task queue
-        let task_queue = JobQueue::new(io.clone());
-
-        // Add any tasks remaining after startup to the runtime queue
-        for task in startup_task_queue.drain(..) {
-            task_queue.add_job(LeafJob::IoTask(task));
-        }
-
         // Create the event channel
         let (event_tx, event_rx) = flume::unbounded();
 
         // Create the leaf handle
         let leaf = Self {
             id: beelay.peer_id(),
+            io: io.clone(),
             events: event_tx.clone(),
             _phantom: PhantomData,
         };
+
+        // Create our runtime task queue
+        let task_queue = JobQueue::new(leaf.clone());
+
+        // Add any tasks remaining after startup to the runtime queue
+        for task in startup_task_queue.drain(..) {
+            task_queue.add_job(LeafJob::IoTask(task));
+        }
 
         // Create a runner to execute the leaf event loop
         let runner = LeafRunner {
@@ -183,7 +186,7 @@ impl<Doc: Document> Leaf<Doc> {
 
     /// Load a document
     pub async fn load_doc(&self, doc_id: DocumentId) -> Result<Option<Doc>> {
-        let (responder, response) = oneshot::channel();
+        let (responder, response) = futures::channel::oneshot::channel();
         self.events.send(LeafEvent::LoadDoc(responder, doc_id)).ok();
         let events = self.events.clone();
 
